@@ -452,6 +452,7 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 # Model size
 DEPTH = 8               # number of transformer layers
 DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
+MAX_STEPS = 5000        # step-bounded run (replaces the 5-min time budget)
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -496,7 +497,7 @@ wandb.init(
         "scalar_lr": SCALAR_LR,
         "weight_decay": WEIGHT_DECAY,
         "window_pattern": WINDOW_PATTERN,
-        "time_budget_s": TIME_BUDGET,
+        "max_steps": MAX_STEPS,
     },
 )
 
@@ -531,7 +532,7 @@ model = torch.compile(model, dynamic=False)
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
 x, y, epoch = next(train_loader)  # prefetch first batch
 
-print(f"Time budget: {TIME_BUDGET}s")
+print(f"Max steps: {MAX_STEPS}")
 print(f"Gradient accumulation steps: {grad_accum_steps}")
 
 # Schedules (all based on progress = training_time / TIME_BUDGET)
@@ -560,6 +561,13 @@ t_start_training = time.time()
 smooth_train_loss = 0
 total_training_time = 0
 step = 0
+# Running (global) loss stats for train and per-step validation
+train_loss_sum = 0.0
+train_loss_max = 0.0
+val_loss_sum = 0.0
+val_loss_max = 0.0
+# Cheap per-step validation: one held-out val batch per step
+val_loader_stream = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "val")
 
 while True:
     torch.cuda.synchronize()
@@ -572,8 +580,8 @@ while True:
         loss.backward()
         x, y, epoch = next(train_loader)
 
-    # Progress and schedules
-    progress = min(total_training_time / TIME_BUDGET, 1.0)
+    # Progress and schedules (step-based; time budget removed)
+    progress = min(step / MAX_STEPS, 1.0)
     lrm = get_lr_multiplier(progress)
     muon_momentum = get_muon_momentum(step)
     muon_weight_decay = get_weight_decay(progress)
@@ -599,6 +607,15 @@ while True:
     if step > 10:
         total_training_time += dt
 
+    # Cheap per-step validation loss on one held-out batch (not counted in dt/mfu)
+    try:
+        xv, yv, _ = next(val_loader_stream)
+    except StopIteration:
+        val_loader_stream = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "val")
+        xv, yv, _ = next(val_loader_stream)
+    with torch.no_grad(), autocast_ctx:
+        val_loss_f = model(xv, yv).item()
+
     # Logging
     ema_beta = 0.9
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
@@ -606,38 +623,57 @@ while True:
     pct_done = 100 * progress
     tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
     mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
-    remaining = max(0, TIME_BUDGET - total_training_time)
+    steps_left = MAX_STEPS - (step + 1)
 
-    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
+    # Running global stats (train + val)
+    train_loss_sum += train_loss_f
+    train_loss_max = max(train_loss_max, train_loss_f)
+    val_loss_sum += val_loss_f
+    val_loss_max = max(val_loss_max, val_loss_f)
+    n_logged = step + 1
+    cur_lr = next(g["lr"] for g in optimizer.param_groups if g["kind"] == "muon")
+    mem_active_gib = torch.cuda.max_memory_allocated() / 1024**3
+    mem_reserved_gib = torch.cuda.max_memory_reserved() / 1024**3
 
-    if step % 10 == 0:
-        wandb.log({
-            "train/loss": debiased_smooth_loss,
-            "train/lr_mult": lrm,
-            "train/mfu": mfu,
-            "train/tok_per_sec": tok_per_sec,
-            "train/progress": progress,
-        }, step=step)
+    print(f"\rstep {step:05d} ({pct_done:.1f}%) | train: {train_loss_f:.4f} | val: {val_loss_f:.4f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | steps_left: {steps_left}    ", end="", flush=True)
+
+    wandb.log({
+        "train/loss": train_loss_f,
+        "train/loss_smooth": debiased_smooth_loss,
+        "val/loss": val_loss_f,
+        "loss_metrics/global_avg_loss": train_loss_sum / n_logged,
+        "loss_metrics/global_max_loss": train_loss_max,
+        "val/global_avg_loss": val_loss_sum / n_logged,
+        "val/global_max_loss": val_loss_max,
+        "lr": cur_lr,
+        "lr_mult": lrm,
+        "mfu": mfu,
+        "throughput(tps)": tok_per_sec,
+        "n_tokens_seen": n_logged * TOTAL_BATCH_SIZE,
+        "memory/max_active(GiB)": mem_active_gib,
+        "memory/max_reserved(GiB)": mem_reserved_gib,
+        "progress": progress,
+    }, step=step)
 
     # GC management (Python's GC causes ~500ms stalls)
     if step == 0:
         gc.collect()
         gc.freeze()
         gc.disable()
-    elif (step + 1) % 5000 == 0:
+    elif (step + 1) % 1000 == 0:
         gc.collect()
 
     step += 1
 
-    # Time's up — but only stop after warmup steps so we don't count compilation
-    if step > 10 and total_training_time >= TIME_BUDGET:
+    # Stop after a fixed number of steps
+    if step >= MAX_STEPS:
         break
 
 print()  # newline after \r training log
 
 total_tokens = step * TOTAL_BATCH_SIZE
 
-# Final eval
+# Final eval (canonical val_bpb over EVAL_TOKENS)
 model.eval()
 with autocast_ctx:
     val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
@@ -661,9 +697,12 @@ print(f"depth:            {DEPTH}")
 
 wandb.log({
     "val_bpb": val_bpb,
+    "val/final_avg_loss": val_loss_sum / max(step, 1),
+    "val/final_max_loss": val_loss_max,
     "training_seconds": total_training_time,
     "total_seconds": t_end - t_start,
-    "peak_vram_mb": peak_vram_mb,
+    "memory/max_active(GiB)": peak_vram_mb / 1024,
+    "memory/max_reserved(GiB)": torch.cuda.max_memory_reserved() / 1024**3,
     "mfu_percent": steady_state_mfu,
     "total_tokens_M": total_tokens / 1e6,
     "num_steps": step,
