@@ -889,7 +889,7 @@ FINAL_LR_FRAC = 0.05  # restored FLR=0.05
 # Model size
 DEPTH = 8  # number of transformer layers
 DEVICE_BATCH_SIZE = 72  # per-device batch size -- B200
-MAX_STEPS = 1000        # step-bounded run (replaces the 5-min time budget)
+MAX_STEPS = 2000        # step-bounded run (replaces the 5-min time budget)
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
