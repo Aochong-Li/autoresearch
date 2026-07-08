@@ -25,6 +25,9 @@ fa3 = get_kernel(repo).flash_attn_interface
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
+import wandb
+RUN_NAME = os.environ.get("RUN_NAME", "baseline")
+
 # ---------------------------------------------------------------------------
 # GPT Model
 # ---------------------------------------------------------------------------
@@ -479,6 +482,24 @@ def build_model_config(depth):
 config = build_model_config(DEPTH)
 print(f"Model config: {asdict(config)}")
 
+wandb.init(
+    project="nanogpt",
+    name=RUN_NAME,
+    config={
+        **asdict(config),
+        "depth": DEPTH,
+        "device_batch_size": DEVICE_BATCH_SIZE,
+        "total_batch_size": TOTAL_BATCH_SIZE,
+        "matrix_lr": MATRIX_LR,
+        "embedding_lr": EMBEDDING_LR,
+        "unembedding_lr": UNEMBEDDING_LR,
+        "scalar_lr": SCALAR_LR,
+        "weight_decay": WEIGHT_DECAY,
+        "window_pattern": WINDOW_PATTERN,
+        "time_budget_s": TIME_BUDGET,
+    },
+)
+
 with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
@@ -589,6 +610,15 @@ while True:
 
     print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
 
+    if step % 10 == 0:
+        wandb.log({
+            "train/loss": debiased_smooth_loss,
+            "train/lr_mult": lrm,
+            "train/mfu": mfu,
+            "train/tok_per_sec": tok_per_sec,
+            "train/progress": progress,
+        }, step=step)
+
     # GC management (Python's GC causes ~500ms stalls)
     if step == 0:
         gc.collect()
@@ -628,3 +658,16 @@ print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {DEPTH}")
+
+wandb.log({
+    "val_bpb": val_bpb,
+    "training_seconds": total_training_time,
+    "total_seconds": t_end - t_start,
+    "peak_vram_mb": peak_vram_mb,
+    "mfu_percent": steady_state_mfu,
+    "total_tokens_M": total_tokens / 1e6,
+    "num_steps": step,
+    "num_params_M": num_params / 1e6,
+})
+wandb.summary["val_bpb"] = val_bpb
+wandb.finish()
