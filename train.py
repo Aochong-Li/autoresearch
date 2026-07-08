@@ -452,7 +452,7 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 # Model size
 DEPTH = 8               # number of transformer layers
 DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
-MAX_STEPS = 2000        # step-bounded run (replaces the 5-min time budget)
+MAX_STEPS = 1000        # step-bounded run (replaces the 5-min time budget)
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -566,6 +566,7 @@ train_loss_sum = 0.0
 train_loss_max = 0.0
 val_loss_sum = 0.0
 val_loss_max = 0.0
+grad_global_norm_max = 0.0
 # Cheap per-step validation: one held-out val batch per step
 val_loader_stream = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "val")
 
@@ -590,6 +591,15 @@ while True:
         if group['kind'] == 'muon':
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
+    # Gradient / parameter global norms (before the step consumes/zeros grads)
+    with torch.no_grad():
+        grad_global_norm = torch.norm(torch.stack([
+            p.grad.detach().norm() for p in model.parameters() if p.grad is not None
+        ])).item()
+        param_global_norm = torch.norm(torch.stack([
+            p.detach().norm() for p in model.parameters()
+        ])).item()
+    grad_global_norm_max = max(grad_global_norm_max, grad_global_norm)
     optimizer.step()
     model.zero_grad(set_to_none=True)
 
@@ -608,6 +618,8 @@ while True:
         total_training_time += dt
 
     # Cheap per-step validation loss on one held-out batch (not counted in dt/mfu)
+    torch.cuda.synchronize()
+    _tv0 = time.time()
     try:
         xv, yv, _ = next(val_loader_stream)
     except StopIteration:
@@ -615,6 +627,8 @@ while True:
         xv, yv, _ = next(val_loader_stream)
     with torch.no_grad(), autocast_ctx:
         val_loss_f = model(xv, yv).item()
+    torch.cuda.synchronize()
+    val_ms = (time.time() - _tv0) * 1000
 
     # Logging
     ema_beta = 0.9
@@ -634,6 +648,10 @@ while True:
     cur_lr = next(g["lr"] for g in optimizer.param_groups if g["kind"] == "muon")
     mem_active_gib = torch.cuda.max_memory_allocated() / 1024**3
     mem_reserved_gib = torch.cuda.max_memory_reserved() / 1024**3
+    _mem_stats = torch.cuda.memory_stats()
+    mem_num_ooms = _mem_stats.get("num_ooms", 0)
+    mem_num_alloc_retries = _mem_stats.get("num_alloc_retries", 0)
+    update_param_ratio = (cur_lr * grad_global_norm) / (param_global_norm + 1e-12)
 
     print(f"\rstep {step:05d} ({pct_done:.1f}%) | train: {train_loss_f:.4f} | val: {val_loss_f:.4f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | steps_left: {steps_left}    ", end="", flush=True)
 
@@ -652,6 +670,17 @@ while True:
         "n_tokens_seen": n_logged * TOTAL_BATCH_SIZE,
         "memory/max_active(GiB)": mem_active_gib,
         "memory/max_reserved(GiB)": mem_reserved_gib,
+        "memory/num_ooms": mem_num_ooms,
+        "memory/num_alloc_retries": mem_num_alloc_retries,
+        "grad/global_norm": grad_global_norm,
+        "grad/global_norm_max": grad_global_norm_max,
+        "weights/global_param_norm": param_global_norm,
+        "grad/update_param_ratio": update_param_ratio,
+        "train_val_gap": debiased_smooth_loss - val_loss_f,
+        "opt/muon_momentum": muon_momentum,
+        "opt/muon_weight_decay": muon_weight_decay,
+        "time/step_ms": dt * 1000,
+        "time/val_ms": val_ms,
         "progress": progress,
     }, step=step)
 
