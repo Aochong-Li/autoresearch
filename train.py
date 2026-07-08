@@ -93,7 +93,7 @@ else:
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, evaluate_bpb, make_dataloader  # noqa: E402
 
 import wandb
-RUN_NAME = os.environ.get("RUN_NAME", "rsi")
+RUN_NAME = os.environ.get("RUN_NAME", "recursive")
 
 # ---------------------------------------------------------------------------
 # GPT Model
