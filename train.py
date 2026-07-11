@@ -333,9 +333,11 @@ class RoutedGPT(nn.Module):
         self.config = config
         self.pool_k = pool_k
         self.route_steps = route_steps
-        long_w, short_w = (config.sequence_len, 0), (config.sequence_len // 2, 0)
+        # Per-pool-block attention span: L=full, S=half, T=quarter (rsi TTTL). Router picks span.
+        long_w = (config.sequence_len, 0)
+        char_to_window = {"L": long_w, "S": (config.sequence_len // 2, 0), "T": (config.sequence_len // 4, 0)}
         pattern = config.window_pattern.upper()
-        self.pool_windows = [{"L": long_w, "S": short_w}[pattern[k % len(pattern)]] for k in range(pool_k)]
+        self.pool_windows = [char_to_window[pattern[k % len(pattern)]] for k in range(pool_k)]
         self.win_long = long_w
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(config.vocab_size, config.n_embd),
@@ -690,9 +692,9 @@ class MuonAdamW(torch.optim.Optimizer):
 # ---------------------------------------------------------------------------
 
 # Model architecture
-ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
+ASPECT_RATIO = 96       # model_dim = depth * ASPECT_RATIO -> n_embd=768, n_head=6 (matches rsi block shape)
 HEAD_DIM = 128          # target head dimension for attention
-WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
+WINDOW_PATTERN = "L"    # full attention on every block (most expressive; no sliding-window approximation)
 
 # Optimization
 TOTAL_BATCH_SIZE = 2**19 # ~524K tokens per optimizer step
@@ -728,9 +730,10 @@ SEQ_INIT_BIAS = 4.0      # prob mass on the recursive program at init
 LB_COEF = 0.003          # load-balance aux loss (marginal block usage, halt excluded)
 Z_COEF = 3e-4            # router z-loss (ST-MoE)
 if ROUTED:
-    # dense K-block x D-step unroll retains ~K*D block activations (vs DEPTH for baseline) -> big VRAM.
-    # Start conservative; grad-accum preserves TOTAL_BATCH_SIZE. If OOM: lower further / add checkpointing.
-    DEVICE_BATCH_SIZE = 16
+    # dense K-block x D-step unroll retains ~K*D block activations (vs DEPTH for baseline) -> big VRAM,
+    # amplified by the 768-dim (rsi-shape) blocks. Start conservative; grad-accum preserves
+    # TOTAL_BATCH_SIZE. Raise in the smoke run if headroom; lower / add checkpointing if OOM.
+    DEVICE_BATCH_SIZE = 8
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
