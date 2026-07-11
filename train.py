@@ -716,7 +716,7 @@ class MuonAdamW(torch.optim.Optimizer):
 # Model architecture
 ASPECT_RATIO = 96       # model_dim = depth * ASPECT_RATIO -> n_embd=768, n_head=6 (matches rsi block shape)
 HEAD_DIM = 128          # target head dimension for attention
-WINDOW_PATTERN = "L"    # full attention on every block (most expressive; no sliding-window approximation)
+WINDOW_PATTERN = "SSSL" # sliding window (S=half ctx, L=full every 4th) — big attention save vs full-L
 
 # Optimization
 TOTAL_BATCH_SIZE = 2**19 # ~524K tokens per optimizer step
@@ -755,7 +755,7 @@ if ROUTED:
     # dense K-block x D-step unroll retains ~K*D block activations (vs DEPTH for baseline) -> big VRAM,
     # amplified by the 768-dim (rsi-shape) blocks. Start conservative; grad-accum preserves
     # TOTAL_BATCH_SIZE. Raise in the smoke run if headroom; lower / add checkpointing if OOM.
-    DEVICE_BATCH_SIZE = 8
+    DEVICE_BATCH_SIZE = 16  # power of 2 required (TOTAL_BATCH_SIZE=2^19 must divide evenly)
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
