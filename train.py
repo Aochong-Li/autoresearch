@@ -415,6 +415,10 @@ class RoutedGPT(nn.Module):
             torch.nn.init.zeros_(self.router.fc1.bias)
             torch.nn.init.zeros_(self.router.fc2.weight)  # logits == table at init
             torch.nn.init.zeros_(self.router.fc2.bias)
+        # Schedule buffers were created on meta device; to_empty() left them uninitialized (garbage).
+        # Set them explicitly so the FIRST forward (which runs before set_router_schedule) is sane.
+        self.router_temp.fill_(ROUTER_TEMP_START)
+        self.router_hard.fill_(0.0)
         # Rotary + bf16 casts (mirrors GPT.init_weights)
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
