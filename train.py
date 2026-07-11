@@ -495,13 +495,20 @@ class RoutedGPT(nn.Module):
         cos_sin = self.cos[:, :T], self.sin[:, :T]
         K = self.pool_k
 
+        _dbg = os.environ.get("DBG_NAN") and self.training
+        def _ck(tag, t):
+            if _dbg and not torch.isfinite(t).all():
+                print(f"[nan] first non-finite at {tag}", flush=True); raise SystemExit(3)
+
         x = norm(self.transformer.wte(idx))
         x0 = x
         # Value embeddings depend only on idx: compute once, reuse across all steps
         ve = {key: emb(idx) for key, emb in self.value_embeds.items()}
+        _ck("wte", x)
 
         x = self.resid_lambdas[0] * x + self.x0_lambdas[0] * x0
         x = self.block_in(x, None, cos_sin, self.win_long)
+        _ck("block_in", x)
 
         probs_sum = None  # noise-free router probs, accumulated for aux losses
         z_acc = None
@@ -529,16 +536,20 @@ class RoutedGPT(nn.Module):
             probs_sum = p_clean if probs_sum is None else probs_sum + p_clean
             z = torch.logsumexp(logits, dim=-1).square().mean()
             z_acc = z if z_acc is None else z_acc + z
+            _ck(f"router_w_t{t}", w)
             w = w.to(x_in.dtype)
             outs = torch.stack([
                 blk(x_in, ve.get(str(k)), cos_sin, self.pool_windows[k])
                 for k, blk in enumerate(self.pool)
             ])  # (K, B, T, C)
+            _ck(f"pool_outs_t{t}", outs)
             # identity option leaves x untouched (true no-op -> tail of identities == early exit)
             x = w[:, K].view(B, 1, 1) * x + torch.einsum('bk,kbtc->btc', w[:, :K], outs)
+            _ck(f"x_after_t{t}", x)
 
         x = self.resid_lambdas[-1] * x + self.x0_lambdas[-1] * x0
         x = self.block_out(x, ve["out"], cos_sin, self.win_long)
+        _ck("block_out", x)
         x = norm(x)
 
         softcap = 15
@@ -826,7 +837,8 @@ optimizer = model.setup_optimizer(
 )
 
 raw_model = model  # keep uncompiled handle for buffers/router diagnostics
-model = torch.compile(model, dynamic=False)
+if not os.environ.get("DBG_NAN"):
+    model = torch.compile(model, dynamic=False)
 
 def set_router_schedule(progress):
     if not ROUTED:
