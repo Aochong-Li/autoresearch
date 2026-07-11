@@ -17,6 +17,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# The router adds several distinct AdamW param shapes (table, step-emb, fc1/fc2 + biases); the
+# fused compiled optimizer steps specialize per shape, so raise the dynamo cache/recompile limit
+# above the default 8 to fit them all (one-time compiles, then cached).
+import torch._dynamo
+torch._dynamo.config.cache_size_limit = 128
+torch._dynamo.config.accumulated_cache_size_limit = 512
+
 from kernels import get_kernel
 cap = torch.cuda.get_device_capability()
 # varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
