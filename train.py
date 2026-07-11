@@ -915,9 +915,13 @@ while True:
 
     train_loss_f = train_loss.item()
 
+    if step <= 2:
+        print(f"[dbg] step {step} loss={train_loss_f} grad_norm={grad_global_norm:.3e} "
+              f"param_norm={param_global_norm:.3e} router_tbl_grad={router_table_grad_norm:.3e}", flush=True)
+
     # Fast fail: abort if loss is exploding or NaN
     if math.isnan(train_loss_f) or train_loss_f > 100:
-        print("FAIL")
+        print(f"FAIL loss={train_loss_f} grad_norm={grad_global_norm:.3e}")
         exit(1)
 
     torch.cuda.synchronize()
